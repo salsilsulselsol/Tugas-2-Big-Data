@@ -130,10 +130,4 @@ python yfinance_transform.py
 pip install pymongo pyspark transformers torch yfinance
 ```
 
-## Pengembangan Lebih Lanjut
-- Penambahan fitur visualisasi data
-- Implementasi analisis sentimen berita
-- Integrasi dengan dashboard monitoring
-- Analisis korelasi antara berita dan pergerakan harga saham
-
 ---
