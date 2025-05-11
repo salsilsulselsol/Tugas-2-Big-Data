@@ -1,162 +1,419 @@
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, mean, date_format, row_number, lit
-from pyspark.sql.functions import sum, max, min, stddev, count
-from pyspark.sql.functions import to_timestamp
-from pyspark.sql.window import Window
-from pymongo import MongoClient
-import csv
+import os
+import sys
 import logging
-from datetime import datetime
+import json
 import time
+import pandas as pd
+from pymongo import MongoClient
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, lit, when, expr, coalesce
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType, IntegerType
 
-# Konfigurasi logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('idx_data_processing.log', mode='w')
+    ]
+)
+logger = logging.getLogger(_name_)
 
-# Konfigurasi MongoDB
+# MongoDB Configuration
 MONGO_URI = "mongodb://localhost:27017"
-DB_NAME = "Yfinance"
-DB_FINAL = "Yfinance_Final"
-DF_Saham = "Daftar_Saham.csv"
+SOURCE_DATABASE_NAME = "IDXData"
+OUTPUT_DATABASE_NAME = "idx_final"
 
-# Baca nama perusahaan (koleksi) dari CSV
-def read_collection_names(csv_file):
-    try:
-        with open(csv_file, newline='', encoding='utf-8') as file:
-            reader = csv.DictReader(file)
-            return [row["Nama Perusahaan"] for i, row in enumerate(reader)]
-    except Exception as e:
-        logger.error(f"Gagal membaca CSV: {e}")
-        return []
-
-# Fungsi untuk inisialisasi Spark Session
-def create_spark_session(stock_collection_name=None):
-    if not stock_collection_name:
-        raise ValueError("Nama koleksi tidak boleh kosong")
-    
-    return (SparkSession.builder
-            .appName("Read Stock Data from MongoDB")
-            .config("spark.jars.packages", "org.mongodb.spark:mongo-spark-connector_2.12:3.0.1")
-            .config("spark.mongodb.input.uri", f"{MONGO_URI}/{DB_NAME}.{stock_collection_name}")
-            .config("spark.mongodb.read.connection.uri", f"{MONGO_URI}/{DB_NAME}.{stock_collection_name}") 
-            .config("spark.mongodb.write.connection.uri", f"{MONGO_URI}/{DB_FINAL}.{stock_collection_name}")
-            .config("spark.executor.memory", "4g")
-            .config("spark.driver.memory", "4g")
-            .getOrCreate())
-
-# Fungsi agregasi berdasarkan Spark
-def aggregate_period(df, period, label):
-    # Format tanggal
-    df = df.withColumn("period_key", date_format("Date", period))
-
-    # Lakukan agregasi lengkap
-    agg_df = df.groupBy("period_key").agg(
-        mean("Open").alias("avg_open"),
-        mean("High").alias("avg_high"),
-        mean("Low").alias("avg_low"),
-        mean("Close").alias("avg_close"),
-        mean("Volume").alias("avg_volume"),
-        mean("Dividends").alias("avg_dividends"),
-        mean("Stock Splits").alias("avg_stock_splits"),
-        sum("Open").alias("sum_open"),
-        sum("High").alias("sum_high"),
-        sum("Low").alias("sum_low"),
-        sum("Close").alias("sum_close"),
-        sum("Volume").alias("sum_volume"),
-        sum("Dividends").alias("sum_dividends"),
-        sum("Stock Splits").alias("sum_stock_splits"),
-        max("Open").alias("max_open"),
-        max("High").alias("max_high"),
-        max("Low").alias("max_low"),
-        max("Close").alias("max_close"),
-        max("Volume").alias("max_volume"),
-        max("Dividends").alias("max_dividends"),
-        max("Stock Splits").alias("max_stock_splits"),
-        min("Open").alias("min_open"),
-        min("High").alias("min_high"),
-        min("Low").alias("min_low"),
-        min("Close").alias("min_close"),
-        min("Volume").alias("min_volume"),
-        min("Dividends").alias("min_dividends"),
-        min("Stock Splits").alias("min_stock_splits"),
-        stddev("Open").alias("std_open"),
-        stddev("High").alias("std_high"),
-        stddev("Low").alias("std_low"),
-        stddev("Close").alias("std_close"),
-        stddev("Volume").alias("std_volume"),
-        stddev("Dividends").alias("std_dividends"),
-        stddev("Stock Splits").alias("std_stock_splits"),
-        count("*").alias("row_count")
-    )
-
-    windowSpec = Window.orderBy("period_key")
-    agg_df = agg_df.withColumn(f"{label}_number", row_number().over(windowSpec))
-    agg_df = agg_df.withColumn("agg_type", lit(label))
-    return agg_df
-
-if __name__ == "__main__":
-    # Mulai hitung waktu
-    start_time = time.time()
-
-    total_saham_diambil = 0
-    total_data_dalam_db = 0
-
-    koleksi_list = read_collection_names(DF_Saham)
-
-    for nama_koleksi in koleksi_list:
-        spark = create_spark_session(nama_koleksi)
-        spark.sparkContext.setLogLevel("ERROR")
-
-        try:
-            logger.info(f"Membaca data dari MongoDB koleksi: {nama_koleksi}")
-            
-            df = spark.read.format("mongo") \
-                .option("uri", f"{MONGO_URI}/{DB_NAME}.{nama_koleksi}") \
-                .load()
-            
-            if "Date" in df.columns:
-                df = df.withColumn("Date", to_timestamp("Date"))
-                total_saham_diambil += 1
-
-                for period, label in [("yyyy-MM-dd", "day"), ("yyyy-MM", "month"), ("yyyy", "year")]:
-                    if label == "day":
-                        df_day = df.withColumn("period_key", date_format("Date", period))
-                        
-                        df_day.write.format("mongo") \
-                            .option("uri", f"{MONGO_URI}/{DB_FINAL}.{nama_koleksi}") \
-                            .mode("append") \
-                            .save()
-                        
-                        logger.info(f"✅ Data harian disimpan untuk {nama_koleksi}")
-                    else:
-                        agg_df = aggregate_period(df, period, label)
-                        
-                        agg_df.write.format("mongo") \
-                            .option("uri", f"{MONGO_URI}/{DB_FINAL}.{nama_koleksi}") \
-                            .mode("append") \
-                            .save()
-                        
-                        logger.info(f"✅ Agregasi {label} selesai untuk {nama_koleksi}")
-                
-                total_data_dalam_db += df.count()
-
-            else:
-                logger.warning(f"❌ Kolom 'Date' tidak ditemukan pada koleksi {nama_koleksi}")
-
-        except Exception as e:
-            logger.error(f"Terjadi kesalahan: {e}")
-
+# Performance tracking
+class PerformanceTracker:
+    def _init_(self):
+        self.collection_stats = {}
+        self.total_documents = 0
+        self.total_time = 0
         
+    def add_collection_stat(self, collection_name, document_count, execution_time):
+        velocity = document_count / execution_time if execution_time > 0 else 0
+        self.collection_stats[collection_name] = {
+            'documents': document_count,
+            'time_seconds': execution_time,
+            'velocity_docs_per_second': velocity
+        }
+        self.total_documents += document_count
+        self.total_time += execution_time
     
-    spark.stop()
-    logger.info("Spark session dihentikan")
+    def get_overall_stats(self):
+        overall_velocity = self.total_documents / self.total_time if self.total_time > 0 else 0
+        return {
+            'total_documents': self.total_documents,
+            'total_time_seconds': self.total_time,
+            'overall_velocity_docs_per_second': overall_velocity
+        }
+    
+    def generate_report(self):
+        report = "===== PERFORMANCE REPORT =====\n\n"
+        
+        # Per collection stats
+        report += "COLLECTION STATISTICS:\n"
+        report += "-" * 70 + "\n"
+        report += f"{'Collection':<20} {'Documents':<12} {'Time (s)':<12} {'Velocity (docs/s)':<20}\n"
+        report += "-" * 70 + "\n"
+        
+        for collection, stats in self.collection_stats.items():
+            report += f"{collection:<20} {stats['documents']:<12} {stats['time_seconds']:.2f}s{' ':<8} {stats['velocity_docs_per_second']:.2f}\n"
+        
+        # Overall stats
+        overall = self.get_overall_stats()
+        report += "\nOVERALL STATISTICS:\n"
+        report += "-" * 70 + "\n"
+        report += f"Total documents processed: {overall['total_documents']}\n"
+        report += f"Total execution time: {overall['total_time_seconds']:.2f} seconds\n"
+        report += f"Overall velocity: {overall['overall_velocity_docs_per_second']:.2f} documents/second\n"
+        report += "-" * 70 + "\n"
+        
+        return report
 
-    # Hitung waktu eksekusi
-    elapsed_time = time.time() - start_time
+def create_spark_session():
+    """
+    Create a simple SparkSession for data transformation
+    """
+    try:
+        spark = SparkSession.builder \
+            .appName("IDX Financial Data Processing") \
+            .config("spark.executor.memory", "2g") \
+            .config("spark.driver.memory", "2g") \
+            .master("local[*]") \
+            .getOrCreate()
+        
+        logger.info(f"Created Spark session with version: {spark.version}")
+        return spark
+    
+    except Exception as e:
+        logger.error(f"Failed to create Spark session: {str(e)}")
+        raise
 
-    # Ringkasan
-    print("\n📊 Ringkasan Pengambilan Data:")
-    print(f"📌 Total saham yang berhasil ditransformasi: {total_saham_diambil} dari {len(koleksi_list)} saham")
-    print(f"📦 Total data yang berhasil disimpan di MongoDB: {total_data_dalam_db} dokumen")
-    print(f"⏳ Waktu eksekusi: {elapsed_time:.2f} detik")
-    print("✅ Proses selesai!")
+def get_mongodb_connection():
+    """
+    Create a MongoDB connection using PyMongo
+    """
+    try:
+        client = MongoClient(MONGO_URI)
+        logger.info("Successfully connected to MongoDB")
+        return client
+    except Exception as e:
+        logger.error(f"Failed to connect to MongoDB: {str(e)}")
+        raise
+
+def process_financial_data(spark_df):
+    """
+    Process and transform financial data using Spark to maintain 32 attributes
+    """
+    try:
+        # Step 1: Select base columns and transform
+        df_processed = spark_df.select(
+            # 1-3: Basic identifiers
+            "company_code",
+            "year",
+            "period",
+            
+            # 4-6: Company information
+            col("data.EntityName").alias("company_name"),
+            col("data.Sector").alias("sector"),
+            col("data.Subsector").alias("subsector"),
+            
+            # 7-10: Main financial metrics
+            col("data.SalesAndRevenue").cast("double").alias("revenue"),
+            col("data.GrossProfit").cast("double").alias("gross_profit"),
+            col("data.ProfitLossBeforeIncomeTax").cast("double").alias("profit_before_tax"),
+            col("data.FinanceCosts").cast("double").alias("finance_costs"),
+            col("data.ProfitLoss").cast("double").alias("net_profit"),
+            
+            # 11-15: Balance sheet items
+            col("data.CashAndCashEquivalents").cast("double").alias("cash"),
+            col("data.Assets").cast("double").alias("total_assets"),
+            col("data.ShortTermLoans").cast("double").alias("short_term_loans"),
+            col("data.CurrentMaturitiesOfBankLoans").cast("double").alias("current_maturities"),
+            col("data.LongTermBankLoans").cast("double").alias("long_term_borrowing"),
+            col("data.Equity").cast("double").alias("total_equity"),
+            
+            # 16-18: Cash flow items
+            col("data.NetCashFlowsReceivedFromUsedInOperatingActivities").cast("double").alias("cash_from_operations"),
+            col("data.NetCashFlowsReceivedFromUsedInInvestingActivities").cast("double").alias("cash_from_investing"),
+            col("data.NetCashFlowsReceivedFromUsedInFinancingActivities").cast("double").alias("cash_from_financing"),
+            
+            # 19: Additional balance sheet
+            col("data.Liabilities").cast("double").alias("total_liabilities"),
+            
+            # 20-21: Earnings metrics
+            col("data.BasicEarningsLossPerShareFromContinuingOperations").cast("double").alias("basic_eps"),
+            
+            # 22-24: Expense items
+            col("data.SellingExpenses").cast("double").alias("selling_expenses"),
+            col("data.GeneralAndAdministrativeExpenses").cast("double").alias("g_and_a_expenses"),
+            
+            # 25-26: Current assets and liabilities
+            col("data.CurrentAssets").cast("double").alias("current_assets"),
+            col("data.CurrentLiabilities").cast("double").alias("current_liabilities"),
+        )
+        
+        # Replace null values with 0 for numeric columns
+        all_numeric_cols = [
+            "revenue", "gross_profit", "profit_before_tax", "finance_costs", "net_profit",
+            "cash", "total_assets", "short_term_loans", "current_maturities", "long_term_borrowing",
+            "total_equity", "cash_from_operations", "cash_from_investing", "cash_from_financing",
+            "total_liabilities", "basic_eps", "selling_expenses", "g_and_a_expenses",
+            "current_assets", "current_liabilities"
+        ]
+        
+        for col_name in all_numeric_cols:
+            df_processed = df_processed.fillna(0, subset=[col_name])
+        
+        # Step 2: Add calculated fields
+        
+        # 9: Calculate operating_profit from profit_before_tax and finance_costs
+        df_processed = df_processed.withColumn(
+            "operating_profit",
+            expr("profit_before_tax - finance_costs")
+        )
+        
+        # 13: Calculate short_term_borrowing (use ShortTermLoans or CurrentMaturitiesOfBankLoans if null)
+        df_processed = df_processed.withColumn(
+            "short_term_borrowing",
+            coalesce(col("short_term_loans"), col("current_maturities"), lit(0))
+        )
+        
+        # 20: Calculate EBITDA
+        df_processed = df_processed.withColumn(
+            "ebitda",
+            expr("profit_before_tax + finance_costs")
+        )
+        
+        # 24: Calculate operating_expenses
+        df_processed = df_processed.withColumn(
+            "operating_expenses",
+            expr("selling_expenses + g_and_a_expenses")
+        )
+        
+        # 27: Calculate current_ratio
+        df_processed = df_processed.withColumn(
+            "current_ratio",
+            expr("current_assets / nullif(current_liabilities, 0)")
+        )
+        
+        # 28: Calculate asset_to_equity_ratio
+        df_processed = df_processed.withColumn(
+            "asset_to_equity_ratio",
+            expr("total_assets / nullif(total_equity, 0)")
+        )
+        
+        # 29: Calculate debt_to_equity_ratio
+        df_processed = df_processed.withColumn(
+            "debt_to_equity_ratio",
+            expr("total_liabilities / nullif(total_equity, 0)")
+        )
+        
+        # 30: Calculate gross_margin_pct
+        df_processed = df_processed.withColumn(
+            "gross_margin_pct",
+            expr("gross_profit / nullif(revenue, 0) * 100")
+        )
+        
+        # 31: Calculate operating_margin_pct
+        df_processed = df_processed.withColumn(
+            "operating_margin_pct",
+            expr("operating_profit / nullif(revenue, 0) * 100")
+        )
+        
+        # 32: Calculate net_margin_pct
+        df_processed = df_processed.withColumn(
+            "net_margin_pct",
+            expr("net_profit / nullif(revenue, 0) * 100")
+        )
+        
+        # Step 3: Select final 32 columns in the specified order
+        final_df = df_processed.select(
+            "company_code",
+            "year",
+            "period",
+            "company_name",
+            "sector",
+            "subsector",
+            "revenue",
+            "gross_profit",
+            "operating_profit",
+            "net_profit",
+            "cash",
+            "total_assets",
+            "short_term_borrowing",
+            "long_term_borrowing",
+            "total_equity",
+            "cash_from_operations",
+            "cash_from_investing",
+            "cash_from_financing",
+            "total_liabilities",
+            "ebitda",
+            "basic_eps",
+            "selling_expenses",
+            "g_and_a_expenses",
+            "operating_expenses",
+            "current_assets",
+            "current_liabilities",
+            "current_ratio",
+            "asset_to_equity_ratio",
+            "debt_to_equity_ratio",
+            "gross_margin_pct",
+            "operating_margin_pct",
+            "net_margin_pct"
+        )
+        
+        return final_df
+    
+    except Exception as e:
+        logger.error(f"Error in data processing: {str(e)}")
+        raise
+
+def process_collection(spark, mongo_client, collection_name, performance_tracker):
+    """
+    Process a specific MongoDB collection using PyMongo and Spark
+    """
+    start_time = time.time()
+    document_count = 0
+    
+    try:
+        logger.info(f"Processing collection: {collection_name}")
+        
+        # Step 1: Read data from MongoDB using PyMongo
+        source_db = mongo_client[SOURCE_DATABASE_NAME]
+        output_db = mongo_client[OUTPUT_DATABASE_NAME]
+        
+        # Check if collection exists
+        if collection_name not in source_db.list_collection_names():
+            logger.warning(f"Collection {collection_name} not found in source database")
+            return 0
+        
+        source_collection = source_db[collection_name]
+        
+        # Fetch data from MongoDB
+        mongo_data = list(source_collection.find())
+        document_count = len(mongo_data)
+        logger.info(f"Total records read: {document_count}")
+        
+        # Handle MongoDB ObjectId for JSON serialization
+        for doc in mongo_data:
+            doc['_id'] = str(doc['_id'])
+        
+        # Convert to pandas
+        df_pandas = pd.DataFrame(mongo_data)
+        
+        # Step 2: Convert Pandas DataFrame to Spark DataFrame
+        spark_df = spark.createDataFrame(df_pandas)
+        logger.info("Successfully converted MongoDB data to Spark DataFrame")
+        
+        # Step 3: Process data using Spark
+        processed_df = process_financial_data(spark_df)
+        processed_count = processed_df.count()
+        logger.info(f"Processed records: {processed_count}")
+        
+        # Step 4: Convert back to Pandas for MongoDB storage
+        pandas_processed = processed_df.toPandas()
+        
+        # Step 5: Write processed data back to MongoDB using PyMongo
+        output_collection = output_db[f"{collection_name}_final"]
+        
+        # Clear existing data
+        output_collection.drop()
+        
+        # Convert pandas DataFrame to list of dictionaries
+        records = pandas_processed.to_dict('records')
+        
+        # Insert data in batch
+        if records:
+            output_collection.insert_many(records)
+            logger.info(f"Saved {len(records)} records to {collection_name}_final collection")
+        else:
+            logger.warning("No records to insert after processing")
+        
+        elapsed_time = time.time() - start_time
+        logger.info(f"Processing time for {collection_name}: {elapsed_time:.2f} seconds")
+        
+        # Calculate documents per second
+        docs_per_second = document_count / elapsed_time if elapsed_time > 0 else 0
+        logger.info(f"Processing velocity for {collection_name}: {docs_per_second:.2f} documents/second")
+        
+        # Record performance statistics
+        performance_tracker.add_collection_stat(collection_name, document_count, elapsed_time)
+        
+        logger.info(f"Successfully processed {collection_name}")
+        return document_count
+    
+    except Exception as e:
+        elapsed_time = time.time() - start_time
+        logger.error(f"Error processing collection {collection_name}: {str(e)}")
+        
+        # Record failed performance statistics
+        performance_tracker.add_collection_stat(collection_name, document_count, elapsed_time)
+        raise
+
+def main():
+    """
+    Main function to process multiple financial data collections
+    """
+    spark = None
+    mongo_client = None
+    performance_tracker = PerformanceTracker()
+    total_start_time = time.time()
+    
+    try:
+        # Create Spark session
+        spark = create_spark_session()
+        
+        # Connect to MongoDB
+        mongo_client = get_mongodb_connection()
+        
+        # Create output database if it doesn't exist
+        if OUTPUT_DATABASE_NAME not in mongo_client.list_database_names():
+            logger.info(f"Creating output database: {OUTPUT_DATABASE_NAME}")
+        
+        # List of collections to process
+        collections = ["Financial_2021", "Financial_2022", "Financial_2023", "Financial_2024"]
+        
+        total_docs = 0
+        
+        # Process each collection
+        for collection in collections:
+            docs = process_collection(spark, mongo_client, collection, performance_tracker)
+            total_docs += docs
+        
+        total_elapsed_time = time.time() - total_start_time
+        
+        # Generate performance report
+        report = performance_tracker.generate_report()
+        
+        # Write report to file
+        with open('performance_report.txt', 'w') as f:
+            f.write(report)
+        
+        # Also print to console
+        print("\n" + report)
+        
+        logger.info(f"Data processing completed successfully!")
+        logger.info(f"Total documents processed: {total_docs}")
+        logger.info(f"Total execution time: {total_elapsed_time:.2f} seconds")
+        logger.info(f"Overall processing velocity: {total_docs/total_elapsed_time:.2f} documents/second")
+    
+    except Exception as e:
+        logger.error(f"Fatal error in main process: {str(e)}")
+        raise
+    
+    finally:
+        # Close connections
+        if mongo_client:
+            mongo_client.close()
+            logger.info("MongoDB connection closed")
+        
+        if spark:
+            spark.stop()
+            logger.info("Spark session closed")
+
+if _name_ == "_main_":
+    main()
